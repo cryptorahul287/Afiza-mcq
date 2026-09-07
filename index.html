@@ -477,14 +477,25 @@ async function pullFirebaseLiveTests(){
 }
 async function pushFirebaseLiveTest(t){
   if(!firebaseReady)return false;
-  try{await firebaseDb.collection(FIREBASE_LIVE_COLLECTION).doc(String(t.id)).set(liveTestForCloud(t),{merge:true});return true;}
+  try{await firebaseDb.collection(FIREBASE_LIVE_COLLECTION).doc(String(t.id)).set(liveTestForCloud(t),{merge:true});
+    t._localOnly=false; save(); return true;}
   catch(e){console.warn('Could not save Live Test online:',e);return false;}
+}
+async function updateFirebaseLiveTest(t){return pushFirebaseLiveTest(t);}
+async function deleteFirebaseLiveTest(id){
+  if(!firebaseReady)return false;
+  try{await firebaseDb.collection(FIREBASE_LIVE_COLLECTION).doc(String(id)).delete();return true;}
+  catch(e){console.warn('Could not delete Live Test online:',e);return false;}
 }
 function startFirebaseLiveListener(){
   if(!firebaseReady)return;
   try{
     firebaseDb.collection(FIREBASE_LIVE_COLLECTION).orderBy('createdAt','desc').limit(200).onSnapshot(s=>{
-      mergeLiveTests(s.docs.map(d=>d.data()));
+      const remote=s.docs.map(d=>d.data());
+      const remoteIds=new Set(remote.map(t=>String(t.id)));
+      const localOnly=(Array.isArray(state.liveTests)?state.liveTests:[]).filter(t=>t&&t.id&&!remoteIds.has(String(t.id))&&t._localOnly);
+      state.liveTests=[...remote,...localOnly].sort((a,b)=>Number(b.createdAt||0)-Number(a.createdAt||0));
+      save();
       if(typeof render==='function'&&location.hash.includes('live'))render();
     },e=>console.warn('Live Test listener:',e));
   }catch(e){console.warn('Live Test listener unavailable:',e);}
@@ -726,11 +737,11 @@ function createLiveTest(){
   const schedule=document.getElementById('liveSchedule')?.value;
   const scheduledAt=schedule?new Date(schedule).toISOString():null;
   if(scheduledAt&&new Date(scheduledAt).getTime()<Date.now())return toast('Schedule time must be in the future');
-  const t={id:'lt_'+Date.now(),createdAt:Date.now(),name:(document.getElementById('liveName')?.value||'My Live Test').trim()||'My Live Test',categories:cats,filters,questionsCount:count,timeMode:liveTimeMode,continueMinutes:liveTimeMode==='continue'?Math.max(1,Number(document.getElementById('liveMinutes')?.value||90)):90,scheduledAt,status:'created',questions:pool.sort(()=>Math.random()-.5).slice(0,count).map(q=>({...q,selected:null,marked:false}))};
+  const t={id:'lt_'+Date.now(),createdAt:Date.now(),_localOnly:!firebaseReady,name:(document.getElementById('liveName')?.value||'My Live Test').trim()||'My Live Test',categories:cats,filters,questionsCount:count,timeMode:liveTimeMode,continueMinutes:liveTimeMode==='continue'?Math.max(1,Number(document.getElementById('liveMinutes')?.value||90)):90,scheduledAt,status:'created',questions:pool.sort(()=>Math.random()-.5).slice(0,count).map(q=>({...q,selected:null,marked:false}))};
   state.liveTests.unshift(t);save();if(firebaseReady)pushFirebaseLiveTest(t);toast(firebaseReady?'Live test created and synced online':'Live test created');render();
 }
-function renameLiveTest(id){const t=state.liveTests.find(x=>x.id===id);if(!t)return;const n=prompt('Rename live test',t.name);if(n&&n.trim()){t.name=n.trim();save();render()}}
-function deleteLiveTest(id){if(confirm('Delete this live test?')){state.liveTests=state.liveTests.filter(x=>x.id!==id);save();render()}}
+function renameLiveTest(id){const t=state.liveTests.find(x=>x.id===id);if(!t)return;const n=prompt('Rename live test',t.name);if(n&&n.trim()){t.name=n.trim();save();if(firebaseReady)updateFirebaseLiveTest(t);render()}}
+function deleteLiveTest(id){if(confirm('Delete this live test?')){state.liveTests=state.liveTests.filter(x=>x.id!==id);save();if(firebaseReady)deleteFirebaseLiveTest(id);render()}}
 function resumeCreatedLiveTest(id){
   if(!session||!session.live||session.liveTestId!==id)return startCreatedLiveTest(id);
   if(liveRemainingSeconds()<=0){finishTest();return;}
