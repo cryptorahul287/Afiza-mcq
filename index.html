@@ -446,7 +446,66 @@ state.bookmarks=Array.isArray(state.bookmarks)?state.bookmarks:[];
 state.attempts=state.attempts||{}; state.tests=Array.isArray(state.tests)?state.tests:[]; state.edits=state.edits||{}; state.liveTests=Array.isArray(state.liveTests)?state.liveTests:[]; state.profile=state.profile||{name:'',email:'',examDate:'',dp:''}; state.settings=state.settings||{};
 // Online Live Test sync (Firebase). Existing localStorage behavior remains intact.
 let firebaseReady=false, firebaseDb=null, firebaseSyncing=false;
+let firebaseUserSyncUnsubscribe=null, firebaseUserSyncWriting=false;
 const FIREBASE_LIVE_COLLECTION='afiza_live_tests';
+const FIREBASE_USER_SYNC_COLLECTION='afiza_user_sync';
+function getDeviceSyncId(){
+  state.settings=state.settings||{};
+  if(!state.settings.syncId){
+    const bytes=new Uint8Array(6); crypto.getRandomValues(bytes);
+    state.settings.syncId='AFIZA-'+Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join('').toUpperCase();
+    save();
+  }
+  return String(state.settings.syncId);
+}
+function setDeviceSyncId(v){
+  const x=String(v||'').trim().toUpperCase().replace(/[^A-Z0-9-]/g,'');
+  if(x.length<6)return toast('Enter a valid Sync ID');
+  if(firebaseUserSyncUnsubscribe){try{firebaseUserSyncUnsubscribe();}catch(e){}}
+  firebaseUserSyncUnsubscribe=null;
+  state.settings=state.settings||{}; state.settings.syncId=x; save();
+  toast('Sync ID saved');
+  if(firebaseReady)startFirebaseUserSync();
+}
+function userStateForCloud(){
+  return {bookmarks:Array.isArray(state.bookmarks)?state.bookmarks:[],tests:Array.isArray(state.tests)?state.tests:[],edits:state.edits&&typeof state.edits==='object'?state.edits:{},updatedAt:Date.now()};
+}
+function mergeFirebaseUserState(d){
+  if(!d)return;
+  if(Array.isArray(d.bookmarks))state.bookmarks=d.bookmarks;
+  if(Array.isArray(d.tests))state.tests=d.tests;
+  if(d.edits&&typeof d.edits==='object')state.edits=d.edits;
+  questions=buildQuestions(); save();
+  if(typeof render==='function')render();
+}
+async function pushFirebaseUserState(){
+  if(!firebaseReady||!firebaseDb||firebaseUserSyncWriting)return false;
+  const syncId=getDeviceSyncId(); if(!syncId)return false;
+  firebaseUserSyncWriting=true;
+  try{
+    await firebaseDb.collection(FIREBASE_USER_SYNC_COLLECTION).doc(syncId).set(userStateForCloud(),{merge:false});
+    return true;
+  }catch(e){console.warn('Could not sync user data online:',e);return false;}
+  finally{firebaseUserSyncWriting=false;}
+}
+async function startFirebaseUserSync(){
+  if(!firebaseReady||!firebaseDb)return false;
+  const syncId=getDeviceSyncId();
+  try{
+    if(firebaseUserSyncUnsubscribe)firebaseUserSyncUnsubscribe();
+    const ref=firebaseDb.collection(FIREBASE_USER_SYNC_COLLECTION).doc(syncId);
+    const snap=await ref.get();
+    if(snap.exists)mergeFirebaseUserState(snap.data());
+    else await pushFirebaseUserState();
+    firebaseUserSyncUnsubscribe=ref.onSnapshot(s=>{
+      if(!s.exists||firebaseUserSyncWriting)return;
+      mergeFirebaseUserState(s.data());
+    },e=>console.warn('User sync listener:',e));
+    return true;
+  }catch(e){console.warn('Could not start user sync:',e);return false;}
+}
+function syncUserData(){ if(firebaseReady) setTimeout(()=>pushFirebaseUserState(),0); }
+
 function firebaseConfigValid(c){return !!(c&&c.apiKey&&!String(c.apiKey).startsWith('PASTE_')&&c.projectId&&!String(c.projectId).startsWith('PASTE_'));}
 async function initFirebaseLiveSync(){
   try{
@@ -457,6 +516,7 @@ async function initFirebaseLiveSync(){
     if(!firebase.auth().currentUser)await firebase.auth().signInAnonymously();
     firebaseReady=true;
     await pullFirebaseLiveTests();
+    await startFirebaseUserSync();
     return true;
   }catch(e){console.warn('Firebase Live Test sync unavailable:',e);return false;}
 }
@@ -1083,6 +1143,7 @@ function saveEditedQuestion(){
   questions=buildQuestions();
   Object.assign(q,updated);
   persistSession();
+  syncUserData();
   closeModal('editModal');
   render();
   toast('Question changes saved');
@@ -1180,15 +1241,15 @@ function bookmarkCurrent(){
   if(!session)return;
   const id=session.questions[session.index].id,t=state.bookmarks.indexOf(id);
   if(t<0)state.bookmarks.push(id);else state.bookmarks.splice(t,1);
-  save();persistSession();render();
+  save();syncUserData();persistSession();render();
 }
 function finishTest(){if(!session)return;clearInterval(timerId);clearTimeout(liveSessionTimerId);let qs=session.questions,correct=qs.filter(q=>q.selected!==null&&q.selected===q.correct).length,incorrect=qs.filter(q=>q.selected!==null&&q.selected!==q.correct).length,unattempted=qs.length-correct-incorrect,accuracy=correct+incorrect?Math.round(correct/(correct+incorrect)*100):0;let score=session.live?Math.round((correct-incorrect/3)*100)/100:correct;let negative=session.live?Math.round((incorrect/3)*100)/100:0;let subjectPerf=groupPerf(qs,q=>q.subject),topicPerf=groupPerf(qs,q=>q.topic);let t={id:session.id,name:session.name,date:new Date().toISOString(),totalQuestions:qs.length,attempted:correct+incorrect,correct,incorrect,unattempted,score,accuracy,negativeMarks:negative,timeTaken:Math.max(0,Math.round((Date.now()-session.started)/1000)),subjectPerf,topicPerf,questions:qs.map(q=>({...q})),mode:session.mode};state.tests.unshift(t);state.tests=state.tests.slice(0,50);if(session.live&&session.liveTestId){state.liveTests=state.liveTests.filter(x=>x.id!==session.liveTestId)}session=null;state.practiceSession=null;save();nav('result?id='+encodeURIComponent(t.id))}
 function groupPerf(qs,key){let m={};qs.forEach(q=>{let k=key(q)||'General';m[k]??={name:k,total:0,attempted:0,correct:0,incorrect:0};m[k].total++;if(q.selected!==null){m[k].attempted++;if(q.selected===q.correct)m[k].correct++;else m[k].incorrect++}});return Object.values(m).map(x=>({...x,accuracy:x.attempted?Math.round(x.correct/x.attempted*100):0}))}
 function result(){let id=new URLSearchParams(location.hash.split('?')[1]||'').get('id'),t=state.tests.find(x=>x.id===id)||state.tests[0];if(!t)return test();return header('Test Result',true)+`<main class="container"><section class="banner"><div style="font-size:52px">🎉</div><h1>Test Completed!</h1><p>${esc(t.name)}</p></section><div class="stats"><div class="stat"><b>${t.score}/${t.totalQuestions}</b><span>Score</span></div><div class="stat"><b>${t.negativeMarks||0}</b><span>Negative Marks</span></div><div class="stat"><b>${t.accuracy}%</b><span>Accuracy</span></div><div class="stat"><b>${t.correct}</b><span>Correct</span></div><div class="stat"><b>${t.incorrect}</b><span>Incorrect</span></div><div class="stat"><b>${t.unattempted}</b><span>Unattempted</span></div></div><div class="actions"><button class="primary" onclick="nav('review?id=${t.id}')">Review Questions</button><button class="secondary" onclick="nav('analysis?id=${t.id}')">View Analysis</button><button class="secondary" onclick="configureTest(${t.totalQuestions},'Retry • ${esc(t.name)}')">Retry</button></div></main>`+bottom('test')}
 function review(){let id=new URLSearchParams(location.hash.split('?')[1]||'').get('id'),t=state.tests.find(x=>x.id===id);if(!t)return progress();let tab=new URLSearchParams(location.hash.split('?')[1]||'').get('tab')||'all';let qs=t.questions.filter(q=>tab==='all'||tab==='correct'&&q.selected===q.correct||tab==='incorrect'&&q.selected!==null&&q.selected!==q.correct||tab==='unattempted'&&q.selected===null||tab==='marked'&&q.marked||tab==='bookmarked'&&state.bookmarks.includes(q.id));return header('Test Review',true)+`<main class="container"><div class="pillrow review-analysis-tabs"><button class="pill active-pill" onclick="nav('review?id=${t.id}')">Review Questions</button><button class="pill" onclick="nav('analysis?id=${t.id}')">Analysis</button></div><section class="testcard review-summary"><h3>${esc(t.name)}</h3><p>${t.correct} correct • ${t.incorrect} incorrect • ${t.unattempted} unattempted</p></section><div class="pillrow review-status-tabs">${['all','correct','incorrect','unattempted','marked','bookmarked'].map(x=>`<button class="pill ${tab===x?'active-pill':''}" onclick="nav('review?id=${t.id}&tab=${x}')">${x.toUpperCase()}</button>`).join('')}</div>${qs.map((q,i)=>`<div class="testcard review-question-card"><b>Q${i+1}. ${esc(q.text)}</b>${q.options.map((o,j)=>`<p style="margin:8px 0;padding:8px;border-radius:10px;background:${j===q.correct?'#e8faef':j===q.selected?'#ffe9ee':'#f8fafc'}">${String.fromCharCode(65+j)}. ${esc(o)}</p>`).join('')}<p><b>Your answer:</b> ${q.selected===null?'Unattempted':String.fromCharCode(65+q.selected)} &nbsp; <b>Correct:</b> ${String.fromCharCode(65+q.correct)}</p><p>${esc(q.explanation)}</p><small>${esc(q.subject)} • ${esc(q.topic)} • ${esc(q.difficulty)}</small><br><button class="secondary" onclick="toggleSaved('${q.id}')">${state.bookmarks.includes(q.id)?'Remove Bookmark':'Bookmark'}</button></div>`).join('')}</main>`+bottom('progress')}
-function toggleSaved(id){let i=state.bookmarks.indexOf(id);if(i<0)state.bookmarks.push(id);else state.bookmarks.splice(i,1);save();if(session)persistSession();render()}
+function toggleSaved(id){let i=state.bookmarks.indexOf(id);if(i<0)state.bookmarks.push(id);else state.bookmarks.splice(i,1);save();syncUserData();if(session)persistSession();render()}
 function renameTest(id){let t=state.tests.find(x=>x.id===id);if(!t)return;let name=prompt('Rename test',t.name||'Test');if(name&&name.trim()){t.name=name.trim();save();render()}}
-function deleteTest(id){let t=state.tests.find(x=>x.id===id);if(!t)return;if(confirm('Delete this test history? This cannot be undone.')){state.tests=state.tests.filter(x=>x.id!==id);save();nav('progress')}}
+function deleteTest(id){let t=state.tests.find(x=>x.id===id);if(!t)return;if(confirm('Delete this test history? This cannot be undone.')){state.tests=state.tests.filter(x=>x.id!==id);save();syncUserData();nav('progress')}}
 function analysis(){let id=new URLSearchParams(location.hash.split('?')[1]||'').get('id'),t=state.tests.find(x=>x.id===id);if(!t)return progress();let total=t.totalQuestions||t.questions.length,attempted=t.attempted??(t.correct+t.incorrect),correct=t.correct||0,incorrect=t.incorrect||0,accuracy=t.accuracy??(attempted?Math.round(correct/attempted*100):0),timeTaken=t.timeTaken||0,avg=total?Math.round(timeTaken/total):0;let fmtTime=s=>{s=Math.max(0,Math.round(s));let h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return h?`${h}h ${m}m ${sec}s`:m?`${m}m ${sec}s`:`${sec}s`};return header('Test Analysis',true)+`<main class="container"><div class="pillrow" style="margin-bottom:12px"><button class="pill" onclick="nav('review?id=${t.id}')">Review Questions</button><button class="pill active-pill" onclick="nav('analysis?id=${t.id}')">Analysis</button></div><section class="testcard analysis-overview"><h3 style="font-size:18px;margin-bottom:12px">${esc(t.name)}</h3><div class="stats" style="grid-template-columns:repeat(2,1fr);gap:8px"><div class="stat"><b>${total}</b><span>Total Questions</span></div><div class="stat"><b>${attempted}</b><span>Attempted</span></div><div class="stat"><b>${correct}</b><span>Correct</span></div><div class="stat"><b>${incorrect}</b><span>Incorrect</span></div><div class="stat"><b>${accuracy}%</b><span>Accuracy</span></div><div class="stat"><b>${fmtTime(timeTaken)}</b><span>Total Time</span></div><div class="stat"><b>${fmtTime(avg)}</b><span>Avg / Question</span></div></div><div class="pillrow" style="margin-top:12px"><button class="secondary" onclick="renameTest('${t.id}')">✏️ Rename Test</button><button class="secondary" onclick="deleteTest('${t.id}')">🗑️ Delete Test</button></div></section>${t.subjectPerf&&t.subjectPerf.length?`<div class="testcard" style="margin-top:12px"><h3>Subject Analysis</h3>${t.subjectPerf.map(x=>`<div class="barrow"><div class="label"><span>${esc(x.name)}</span><span>${x.accuracy}%</span></div><div class="bar"><i style="width:${x.accuracy}%"></i></div><small>${x.correct}/${x.total} correct</small></div>`).join('')}</div>`:''}</main>`+bottom('progress')}
 function progress(){
   let all=Object.values(state.attempts),attempted=all.filter(a=>a.attempted).length,correct=all.filter(a=>a.correct).length,incorrect=all.filter(a=>a.incorrect).length,acc=attempted?Math.round(correct/attempted*100):0;
@@ -1282,7 +1343,7 @@ function saveFirebaseConfigFromProfile(){
 }
 function clearFirebaseConfigFromProfile(){
   state.settings=state.settings||{}; delete state.settings.firebaseConfig; save();
-  toast('Firebase settings cleared'); firebaseReady=false; firebaseDb=null; render();
+  toast('Firebase settings cleared'); if(firebaseUserSyncUnsubscribe){try{firebaseUserSyncUnsubscribe();}catch(e){}} firebaseUserSyncUnsubscribe=null; firebaseReady=false; firebaseDb=null; render();
 }
 function testFirebaseFromProfile(){
   const c=getFirebaseProfileConfig();
@@ -1329,6 +1390,17 @@ function profile(){
       <p class="profile-note" style="margin-top:10px">Status: ${firebaseConfigValid(getFirebaseProfileConfig())?'Configured':'Not configured'}</p>
     </section>
     <section class="testcard profile-card">
+      <h3 style="margin:0 0 8px">☁️ Device Sync</h3>
+      <p class="profile-note">Use the same Sync ID on your phone and tablet. Bookmarks, deleted test history, and question edits will sync through Firebase.</p>
+      <div class="profile-field"><label for="deviceSyncId">Sync ID</label><input id="deviceSyncId" type="text" value="${esc(getDeviceSyncId())}" placeholder="AFIZA-XXXXXXXXXXXX"></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+        <button class="profile-action primary" onclick="setDeviceSyncId(document.getElementById('deviceSyncId').value)">☁️ Save Sync ID</button>
+        <button class="profile-action" onclick="navigator.clipboard?.writeText(getDeviceSyncId());toast('Sync ID copied')">📋 Copy</button>
+        <button class="profile-action" onclick="syncUserData();toast('Sync requested')">🔄 Sync Now</button>
+      </div>
+      <p class="profile-note" style="margin-top:10px">Status: ${firebaseReady?'🟢 Online sync active':'🟡 Firebase not connected'}</p>
+    </section>
+    <section class="testcard profile-card">
       <div class="profile-field"><label>Theme</label><div class="profile-theme-row"><button class="${theme==='light'?'active':''}" onclick="setProfileTheme('light')">☀ Light Mode</button><button class="${theme==='dark'?'active':''}" onclick="setProfileTheme('dark')">🌙 Dark Mode</button></div></div>
     </section>
   </main>`+bottom('home')
@@ -1354,7 +1426,7 @@ function restoreProfileData(input){
 function setProfileTheme(theme){state.settings=state.settings||{};state.settings.theme=theme;save();applyProfileTheme();render()}
 function applyProfileTheme(){const theme=state.settings?.theme||'light';document.body.classList.toggle('dark-mode',theme==='dark')}
 
-function settings(){return header('Settings',true)+`<main class="container"><div class="testcard"><h3>Settings</h3><button class="choice" onclick="if(confirm('Reset progress and test history?')){state={bookmarks:[],attempts:{},tests:[],settings:{},streak:0,edits:{},practiceSession:null};questions=buildQuestions();session=null;save();render()}">Reset Progress</button><button class="choice" onclick="if(confirm('Clear bookmarks?')){state.bookmarks=[];save();render()}">Clear Bookmarks</button></div></main>`+bottom('home')}
+function settings(){return header('Settings',true)+`<main class="container"><div class="testcard"><h3>Settings</h3><button class="choice" onclick="if(confirm('Reset progress and test history?')){state={bookmarks:[],attempts:{},tests:[],settings:{},streak:0,edits:{},practiceSession:null};questions=buildQuestions();session=null;save();render()}">Reset Progress</button><button class="choice" onclick="if(confirm('Clear bookmarks?')){state.bookmarks=[];save();syncUserData();render()}">Clear Bookmarks</button></div></main>`+bottom('home')}
 function menu(){let items=[['⌂','Home','home'],['🎯','AIIMS NORCET','aiims'],['👩‍⚕️','RRB Staff Nurse','rrb'],['🏥','NHM CHO','nhm'],['📖','PR Yadav Practice','pryadav'],['▦','Other Exams','others'],['➕','Create a Live Test','live-create-menu'],['📝','Test / Mock Test','test'],['▥','Progress','progress'],['♡','Bookmarks','bookmarks'],['👤','Profile','profile'],['⚙','Settings','settings']];document.getElementById('menuItems').innerHTML=items.map(x=>`<button onclick="nav('${x[2]}')">${x[0]} &nbsp; ${x[1]}</button>`).join('')}
 function openDrawer(){document.getElementById('drawerback').style.display='block';menu()}function closeDrawer(){document.getElementById('drawerback').style.display='none'}
 function updateLiveCountdowns(){
